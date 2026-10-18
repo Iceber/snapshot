@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import time
 from datetime import datetime, timezone
@@ -28,6 +29,7 @@ from snapshot_e2e.workloads import SOURCE_READY
 from snapshot_e2e.workloads import TestRun
 from snapshot_e2e.workloads import multi_restore_pod
 from snapshot_e2e.workloads import restore_pod
+from snapshot_e2e.workloads import restore_proxy
 from snapshot_e2e.workloads import source_pod
 
 
@@ -1014,6 +1016,32 @@ def checkpoint_agent_pod(config: k8s.E2EConfig, node: str) -> str:
     return agents[0].metadata.name
 
 
+# What the agent logs at start: its NRI plugin registered, or the agent
+# restores without the restore proxy.
+PROXY_REGISTERED_LOG = "Registered with the container runtime"
+PROXY_FALLBACK_LOG = "Restoring without the restore proxy"
+
+
+def restore_proxy_on(config: k8s.E2EConfig, node: str) -> bool:
+    """Whether restores on node run through the restore proxy.
+
+    SNAPSHOT_E2E_RESTORE_PROXY=auto asks the node's agent, for clusters whose
+    nodes may or may not support the proxy. Any other value is restore_proxy().
+    """
+    if os.environ.get("SNAPSHOT_E2E_RESTORE_PROXY") != "auto":
+        return restore_proxy()
+    agent = checkpoint_agent_pod(config, node)
+    # The whole log: the lines are from the agent's start.
+    log = k8s.pod_logs(config.namespace, agent, tail_lines=None, container=AGENT_CONTAINER)
+    if PROXY_REGISTERED_LOG in log:
+        return True
+    if PROXY_FALLBACK_LOG in log:
+        return False
+    raise AssertionError(
+        f"agent {agent} logged neither {PROXY_REGISTERED_LOG!r} nor {PROXY_FALLBACK_LOG!r}"
+    )
+
+
 def assert_restored_state(
     namespace: str,
     pod: str,
@@ -1029,8 +1057,9 @@ def assert_restored_state(
 
     With proxy, also check that the restore proxy is PID 1, and that
     restore-complete names the restored workload. Agents from before the
-    proxy, in upgrade tests, restore without it.
+    proxy, in upgrade tests, and nodes without it restore without it.
     """
+    proxy = proxy and restore_proxy()
     expected_gpu = source_token if gpu else "disabled"
     # The restored process: the CUDA program, or the CPU loop, whose script
     # names the observations file.
