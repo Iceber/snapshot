@@ -442,6 +442,23 @@ func validateCustomStorageRestore(req RestoreRequest, manifest *types.Checkpoint
 	return nil
 }
 
+// lsmProfileFromSpec returns the security label the runtime gave the
+// placeholder container, in CRIU's lsm_profile form, so the restored
+// processes take the container's label, as runc does on its restores. A
+// container without a label gets CRIU's "none".
+func lsmProfileFromSpec(spec *specs.Spec) string {
+	if spec == nil || spec.Process == nil {
+		return criu.LSMProfileNone
+	}
+	if p := spec.Process.ApparmorProfile; p != "" && p != "unconfined" {
+		return "apparmor:" + p
+	}
+	if spec.Process.SelinuxLabel != "" {
+		return "selinux:" + spec.Process.SelinuxLabel
+	}
+	return criu.LSMProfileNone
+}
+
 // readInitCmdline returns the command line of the container's PID 1, given
 // its host PID. Tests replace it.
 var readInitCmdline = func(pid int) (string, error) {
@@ -519,6 +536,7 @@ func inspectRestore(
 	}
 
 	targetRoot := fmt.Sprintf("%s/%d/root", snapshotruntime.HostProcPath, placeholderPID)
+	lsmProfile := lsmProfileFromSpec(ociSpec)
 
 	var (
 		targetGPUs       compat.GPUInfo
@@ -568,6 +586,7 @@ func inspectRestore(
 		PlaceholderPID:  placeholderPID,
 		TargetRoot:      targetRoot,
 		CgroupRoot:      cgroupRoot,
+		LSMProfile:      lsmProfile,
 		CUDADeviceMap:   cudaDeviceMap,
 		GPUMountAliases: gpuMountAliases,
 	}, discoverDuration + deviceMapDuration, nil
@@ -616,6 +635,9 @@ func execNSRestore(ctx context.Context, log logr.Logger, req RestoreRequest, sna
 	}
 	if snap.CgroupRoot != "" {
 		args = append(args, "--cgroup-root", snap.CgroupRoot)
+	}
+	if snap.LSMProfile != "" {
+		args = append(args, "--lsm-profile", snap.LSMProfile)
 	}
 	if req.TargetPodIP != "" {
 		args = append(args, "--target-pod-ip", req.TargetPodIP)

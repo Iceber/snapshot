@@ -266,11 +266,12 @@ type restoreFakeRuntime struct {
 	imageIDError           error
 	imageIDHit             bool
 	env                    []string
+	apparmorProfile        string
 }
 
 func (r *restoreFakeRuntime) ResolveContainer(ctx context.Context, id string) (int, *specs.Spec, error) {
 	r.resolvedID = id
-	return 123, &specs.Spec{Process: &specs.Process{Env: r.env}}, nil
+	return 123, &specs.Spec{Process: &specs.Process{Env: r.env, ApparmorProfile: r.apparmorProfile}}, nil
 }
 
 func (r *restoreFakeRuntime) ResolveContainerIDByPod(ctx context.Context, pod, ns, ctr string) (string, error) {
@@ -428,6 +429,57 @@ func TestInspectRestoreComparesRuntimeImageID(t *testing.T) {
 				t.Fatalf("mismatches = %+v, want %+v", incompatible.Mismatches, tc.want)
 			}
 		})
+	}
+}
+
+func TestLSMProfileFromSpec(t *testing.T) {
+	for name, tc := range map[string]struct {
+		spec *specs.Spec
+		want string
+	}{
+		"AppArmor": {spec: &specs.Spec{Process: &specs.Process{ApparmorProfile: "cri-containerd.apparmor.d"}},
+			want: "apparmor:cri-containerd.apparmor.d"},
+		"SELinux": {spec: &specs.Spec{Process: &specs.Process{SelinuxLabel: "system_u:system_r:container_t:s0:c1,c2"}},
+			want: "selinux:system_u:system_r:container_t:s0:c1,c2"},
+		"unconfined AppArmor": {spec: &specs.Spec{Process: &specs.Process{ApparmorProfile: "unconfined"}},
+			want: criu.LSMProfileNone},
+		"no label":   {spec: &specs.Spec{Process: &specs.Process{}}, want: criu.LSMProfileNone},
+		"no process": {spec: &specs.Spec{}, want: criu.LSMProfileNone},
+		"no spec":    {want: criu.LSMProfileNone},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := lsmProfileFromSpec(tc.spec); got != tc.want {
+				t.Fatalf("lsmProfileFromSpec = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestInspectRestoreTakesThePlaceholdersLSMProfile(t *testing.T) {
+	manifest := types.NewCheckpointManifest(
+		"content-uid-123",
+		"main",
+		types.CRIUDumpManifest{},
+		types.NewSourcePodManifest("source-id", 456, "node-1", "source-pod", "default", "10.0.0.11", nil),
+		types.OverlayManifest{},
+		types.HostManifest{},
+	)
+	rt := &restoreFakeRuntime{apparmorProfile: "cri-containerd.apparmor.d"}
+
+	snap, _, err := inspectRestore(context.Background(), rt, testr.New(t), RestoreRequest{
+		ContentUID:               "content-uid-123",
+		ContainerID:              "placeholder-id",
+		PodName:                  "restore-pod",
+		PodNamespace:             "default",
+		ArtifactContainerName:    "main",
+		DestinationContainerName: "main",
+	}, manifest)
+
+	if err != nil {
+		t.Fatalf("inspectRestore: %v", err)
+	}
+	if snap.LSMProfile != "apparmor:cri-containerd.apparmor.d" {
+		t.Fatalf("LSMProfile = %q", snap.LSMProfile)
 	}
 }
 
@@ -1479,5 +1531,48 @@ func TestNSRestoreFailure(t *testing.T) {
 	err = nsrestoreFailure([]byte("panic: boom"), runErr)
 	if !errors.Is(err, runErr) || !strings.Contains(err.Error(), "stdout: panic: boom") {
 		t.Fatalf("nsrestoreFailure(unstructured) = %v", err)
+	}
+}
+
+// Only an AppArmor profile or "none" needs securityfs, and only where it is
+// missing.
+func TestMountSecurityFSForCRIUMountsOnlyWhenNeeded(t *testing.T) {
+	visible := t.TempDir()
+	if err := os.Mkdir(filepath.Join(visible, "apparmor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, tc := range map[string]struct {
+		path, profile string
+	}{
+		"no profile":               {path: t.TempDir(), profile: ""},
+		"SELinux":                  {path: t.TempDir(), profile: "selinux:system_u:system_r:container_t:s0"},
+		"none, AppArmor visible":   {path: visible, profile: criu.LSMProfileNone},
+		"AppArmor already visible": {path: visible, profile: "apparmor:cri-containerd.apparmor.d"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			unmount, err := mountSecurityFSForCRIU(tc.path, tc.profile, testr.New(t))
+			if err != nil {
+				t.Fatalf("mountSecurityFSForCRIU: %v", err)
+			}
+			if err := unmount(); err != nil {
+				t.Fatalf("unmount: %v", err)
+			}
+		})
+	}
+}
+
+// within bounds the securityfs unmount: a call that blocks gives an error in
+// time, and a call that returns passes its result through.
+func TestWithin(t *testing.T) {
+	unmountErr := errors.New("unmount failed")
+	if err := within(time.Second, func() error { return unmountErr }); !errors.Is(err, unmountErr) {
+		t.Fatalf("within(returns) = %v, want %v", err, unmountErr)
+	}
+
+	block := make(chan struct{})
+	defer close(block)
+	err := within(10*time.Millisecond, func() error { <-block; return nil })
+	if err == nil || !strings.Contains(err.Error(), "no answer in 10ms") {
+		t.Fatalf("within(blocks) = %v, want a timeout", err)
 	}
 }
