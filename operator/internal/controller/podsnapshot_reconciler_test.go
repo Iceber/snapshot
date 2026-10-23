@@ -186,23 +186,29 @@ func TestSnapshotReconciler_BuildPodSnapshotContentCopiesContainersVerbatim(t *t
 
 func TestSnapshotReconciler_StalePodReferenceFails(t *testing.T) {
 	s := snapshotReconcilerScheme()
-	snap := makeSnapshotForReconcile()
-	// The PodSnapshot pins a source pod UID that does not match the live pod (pod-uid-9):
-	// a same-named recreation must not be captured as the wrong workload.
-	snap.Spec.Source.PodRef.UID = types.UID("old-pod-uid")
-	r := makeSnapshotReconciler(s, snap, scheduledPod())
+	// The PodSnapshot pins a source pod UID that does not match the live pod (pod-uid-9): a same-named
+	// recreation must not be captured as the wrong workload, whether or not it has been scheduled yet.
+	for name, nodeName := range map[string]string{"scheduled": "node-a", "unscheduled": ""} {
+		t.Run(name, func(t *testing.T) {
+			snap := makeSnapshotForReconcile()
+			snap.Spec.Source.PodRef.UID = types.UID("old-pod-uid")
+			pod := scheduledPod()
+			pod.Spec.NodeName = nodeName
+			r := makeSnapshotReconciler(s, snap, pod)
 
-	reconcileSnapshot(t, r, snap.Name)
+			reconcileSnapshot(t, r, snap.Name)
 
-	updated := &snapshotv1alpha1.PodSnapshot{}
-	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Namespace: "inference", Name: snap.Name}, updated))
-	cond := meta.FindStatusCondition(updated.Status.Conditions, snapshotv1alpha1.PodSnapshotConditionFailed)
-	require.NotNil(t, cond)
-	assert.Equal(t, "StalePodReference", cond.Reason)
+			updated := &snapshotv1alpha1.PodSnapshot{}
+			require.NoError(t, r.Get(context.Background(), types.NamespacedName{Namespace: "inference", Name: snap.Name}, updated))
+			cond := meta.FindStatusCondition(updated.Status.Conditions, snapshotv1alpha1.PodSnapshotConditionFailed)
+			require.NotNil(t, cond)
+			assert.Equal(t, "StalePodReference", cond.Reason)
 
-	var contents snapshotv1alpha1.PodSnapshotContentList
-	require.NoError(t, r.List(context.Background(), &contents))
-	assert.Empty(t, contents.Items)
+			var contents snapshotv1alpha1.PodSnapshotContentList
+			require.NoError(t, r.List(context.Background(), &contents))
+			assert.Empty(t, contents.Items)
+		})
+	}
 }
 
 func TestSnapshotReconciler_MissingSourcePodFails(t *testing.T) {

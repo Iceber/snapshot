@@ -339,15 +339,16 @@ func (sr *PodSnapshotReconciler) getSourcePod(ctx context.Context, snap *snapsho
 	return pod, nil
 }
 
-// validateSourcePod requires the pod to be scheduled and, when the PodSnapshot pins a source pod UID,
-// to match it (rejecting a same-named recreation). It returns one of two sentinels:
-// errPodSnapshotPodUnscheduled (pending) or errPodSnapshotStalePodRef (terminal).
+// validateSourcePod requires the pod, when the PodSnapshot pins a source pod UID, to match it
+// (rejecting a same-named recreation), and to be scheduled. It returns one of two sentinels:
+// errPodSnapshotStalePodRef (terminal) or errPodSnapshotPodUnscheduled (pending). The UID check
+// comes first: a stale reference is terminal whether or not the replacement ever schedules.
 func validateSourcePod(snap *snapshotv1alpha1.PodSnapshot, pod *corev1.Pod) error {
-	if pod.Spec.NodeName == "" {
-		return errPodSnapshotPodUnscheduled
-	}
 	if wantUID := snap.Spec.Source.PodRef.UID; wantUID != "" && pod.UID != wantUID {
 		return fmt.Errorf("%w: live pod %q UID %q, want %q", errPodSnapshotStalePodRef, pod.Name, pod.UID, wantUID)
+	}
+	if pod.Spec.NodeName == "" {
+		return errPodSnapshotPodUnscheduled
 	}
 	return nil
 }
