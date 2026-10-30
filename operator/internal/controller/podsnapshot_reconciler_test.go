@@ -25,6 +25,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	snapshotv1alpha1 "github.com/ai-dynamo/snapshot/api/v1alpha1"
 	"github.com/ai-dynamo/snapshot/operator/internal/maintenance"
@@ -129,10 +131,16 @@ func TestSnapshotReconciler_PodUnscheduledWaitsPending(t *testing.T) {
 	require.NoError(t, r.Get(context.Background(), key, second))
 	assert.Equal(t, updated.ResourceVersion, second.ResourceVersion)
 
-	// Scheduling unblocks binding.
-	pod.Spec.NodeName = "node-a"
-	require.NoError(t, r.Update(context.Background(), pod))
-	reconcileSnapshot(t, r, snap.Name)
+	// The pod watch is the only wake-up on this path, so the scheduling update must pass the
+	// predicate and map to this snapshot; reconciling that mapped request completes binding.
+	scheduled := pod.DeepCopy()
+	scheduled.Spec.NodeName = "node-a"
+	require.NoError(t, r.Update(context.Background(), scheduled))
+	require.True(t, sourcePodCapturePredicate().Update(event.UpdateEvent{ObjectOld: pod, ObjectNew: scheduled}))
+	requests := r.sourcePodToPodSnapshots(context.Background(), scheduled)
+	require.Equal(t, []reconcile.Request{{NamespacedName: key}}, requests)
+	_, err := r.Reconcile(context.Background(), requests[0])
+	require.NoError(t, err)
 	bound := &snapshotv1alpha1.PodSnapshot{}
 	require.NoError(t, r.Get(context.Background(), key, bound))
 	assert.Equal(t, "podsnapshotcontent-snap-uid", ptr.Deref(bound.Status.BoundPodSnapshotContentName, ""))
